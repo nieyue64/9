@@ -1,38 +1,4 @@
 <!doctype html>
-<!--
-  ============================================================
-  Terraria Ultra - Architecture Refactored Edition
-  ============================================================
-  REFACTORING CHANGELOG (5-Phase Governance):
-  
-  Phase 0 - Safety Net & Performance Baselines:
-    - TU.Safe.run: async/Promise rejection handling, runAsync()
-    - GlobalErrorBoundary: explicit fatal error surfacing
-    - PerformanceBaseline: frame/tick p50/p95/p99 collection
-    - IndexedDB errors surfaced (no more silent swallowing)
-  
-  Phase 1 - Native Class Integration & Timing Fixes:
-    - game:init:post double-fire eliminated (dedup guard)
-    - InputManager.bind: safety patch merged natively (blur/focus reset)
-    - AudioManager: rain synth, cave reverb, weather ambience merged natively
-    - beep()/noise() accept dest param for reverb routing
-  
-  Phase 2 - Render Pipeline & API Isolation:
-    - Global Canvas getContext hijack -> scoped CanvasOptimizer
-    - Renderer.postFxPipeline: ordered array replaces onion wrapping
-    - registerPostFxStage/removePostFxStage API
-    - Unified game.weather state (single source of truth)
-  
-  Phase 3 - Storage Resilience & Worker Rebuild:
-    - StorageAdapter: LS->IDB degradation, quota error surfacing
-    - BlockRegistry: palette mapping in save headers, ID remap on load
-    - WorldWorkerClient.generate: 30s timeout prevents permanent hang
-  
-  Phase 4 - Cleanup & Validation:
-    - Pre-set __xxxInstalled flags disable redundant monkey patches
-    - Architecture comments and deprecation markers
-  ============================================================
--->
 <html lang="zh-CN">
 
 <head>
@@ -5014,49 +4980,24 @@ window.TU = window.TU || {};
 
   function run(tag, fn, opts) {
     try {
-      const result = fn();
-      // Phase 0: Handle Promise-returning functions (async) to prevent silent rejection
-      if (result && typeof result === 'object' && typeof result.then === 'function') {
-        return result.catch(function(e) {
-          _handleError(tag, e, opts);
-          return (opts || {}).fallback;
-        });
-      }
-      return result;
+      return fn();
     } catch (e) {
-      _handleError(tag, e, opts);
-      if (opts && opts.rethrow) throw e;
-      return (opts || {}).fallback;
+      const o = opts || {};
+      const level = o.level || "error";
+      const entry = { tag: tag || "unknown", error: e, at: Date.now() };
+      errors.push(entry);
+      errors.length > maxErrors && errors.splice(0, errors.length - maxErrors);
+      try {
+        log(level, tag, e);
+      } catch(e){console.warn('[Catch]',e);}
+      if (o.toastMessage) toast(o.toastMessage, o.toastMs, o.toastKey || tag, o.cooldownMs);
+      if (o.rethrow) throw e;
+      return o.fallback;
     }
-  }
-
-  /** Phase 0: runAsync - explicit async error boundary, never swallows rejections */
-  async function runAsync(tag, fn, opts) {
-    try {
-      return await fn();
-    } catch (e) {
-      _handleError(tag, e, opts);
-      if (opts && opts.rethrow) throw e;
-      return (opts || {}).fallback;
-    }
-  }
-
-  function _handleError(tag, e, opts) {
-    const o = opts || {};
-    const level = o.level || "error";
-    const entry = { tag: tag || "unknown", error: e, at: Date.now() };
-    errors.push(entry);
-    errors.length > maxErrors && errors.splice(0, errors.length - maxErrors);
-    // Phase 0: ALWAYS log to console.error for fatal visibility - no more silent swallowing
-    try {
-      log(level, '[SafeError] ' + tag, e);
-    } catch(e2){ console.error('[SafeError:logFailed]', tag, e, e2); }
-    if (o.toastMessage) toast(o.toastMessage, o.toastMs, o.toastKey || tag, o.cooldownMs);
   }
 
   TU.Safe = {
     run,
-    runAsync,
     toast,
     shouldFire,
     errors
@@ -5181,100 +5122,25 @@ window.AppServices = new class ServiceLocator {
     this.register("blockHardness", window.BLOCK_HARDNESS);
     this.register("blockLightLut", window.BLOCK_LIGHT_LUT);
     this.register("structuresJson", window.TU_STRUCTURES_JSON);
-    // Phase 3: StorageAdapter with LS -> IDB degradation and explicit error surfacing
-    this.register("storage", (() => {
-      const _lsAvailable = (() => { try { const t = '__tu_test__'; localStorage.setItem(t, '1'); localStorage.removeItem(t); return true; } catch { return false; } })();
-      let _quotaExceeded = false;
-      let _idbFallback = null; // lazy-init IndexedDB reference
-
-      const _getIDB = () => {
-        if (_idbFallback) return _idbFallback;
-        if (window.TU_IndexedDBStorage) { _idbFallback = window.TU_IndexedDBStorage; return _idbFallback; }
-        return null;
-      };
-
-      return {
-        /** @returns {boolean} Whether localStorage is available */
-        get lsAvailable() { return _lsAvailable; },
-        /** @returns {boolean} Whether quota has been exceeded */
-        get quotaExceeded() { return _quotaExceeded; },
-
-        get(k) {
-          try {
-            if (_lsAvailable) return localStorage.getItem(k);
-          } catch (e) {
-            console.warn('[StorageAdapter] LS get failed:', k, e);
-          }
+    this.register("storage", {
+      get: k => {
+        try {
+          return localStorage.getItem(k);
+        } catch (e) {
           return null;
-        },
-
-        set(k, v) {
-          try {
-            if (_lsAvailable) {
-              localStorage.setItem(k, v);
-              _quotaExceeded = false;
-              return;
-            }
-          } catch (e) {
-            // Phase 3: Surface QuotaExceededError explicitly
-            if (e && e.name === 'QuotaExceededError') {
-              _quotaExceeded = true;
-              console.error('[StorageAdapter] QUOTA EXCEEDED for key:', k, 'size:', (v || '').length);
-              if (window.GlobalErrorBoundary) window.GlobalErrorBoundary._report('StorageAdapter.set:quota', e);
-              // Attempt IDB fallback for critical save data
-              const idb = _getIDB();
-              if (idb && (k === 'terraria_ultra_save_v1' || k.startsWith('tu_'))) {
-                idb.set(k, v).catch(e2 => console.error('[StorageAdapter] IDB fallback also failed:', e2));
-              }
-              return;
-            }
-            console.warn('[StorageAdapter] LS set failed:', k, e);
-          }
-        },
-
-        remove(k) {
-          try {
-            if (_lsAvailable) window.localStorage.removeItem(k);
-          } catch(e) { console.warn('[StorageAdapter] LS remove failed:', k, e); }
-        },
-
-        /** Async get with IDB fallback - for save data */
-        async getAsync(k) {
-          // Try LS first
-          try {
-            if (_lsAvailable) {
-              const v = localStorage.getItem(k);
-              if (v) return v;
-            }
-          } catch(e) {}
-          // Fall back to IDB
-          const idb = _getIDB();
-          if (idb) {
-            try { return await idb.get(k); } catch(e) { console.error('[StorageAdapter] IDB getAsync failed:', k, e); }
-          }
-          return null;
-        },
-
-        /** Async set with IDB fallback */
-        async setAsync(k, v) {
-          let lsOk = false;
-          try {
-            if (_lsAvailable) { localStorage.setItem(k, v); lsOk = true; }
-          } catch(e) {
-            if (e && e.name === 'QuotaExceededError') {
-              _quotaExceeded = true;
-              console.error('[StorageAdapter] QUOTA EXCEEDED (async) for key:', k);
-            }
-          }
-          // Always write to IDB as backup
-          const idb = _getIDB();
-          if (idb) {
-            try { await idb.set(k, v); } catch(e) { console.error('[StorageAdapter] IDB setAsync failed:', k, e); }
-          }
-          return { lsOk, idbOk: !!idb };
         }
-      };
-    })());
+      },
+      set: (k, v) => {
+        try {
+          localStorage.setItem(k, v);
+        } catch(e){console.warn('[Catch]',e);}
+      },
+      remove: k => {
+        try {
+          window.localStorage.removeItem(k);
+        } catch(e){console.warn('[Catch]',e);}
+      }
+    });
     this.register("session", {
       get: k => {
         try {
@@ -5532,55 +5398,49 @@ window.Events = {
   once: function(event, cb, opts) { return window.GameEvents.once(event, cb, opts); }
 };
 
-// --- Phase 2: Scoped CanvasOptimizer (replaces global HTMLCanvasElement hijack) ---
-// Instead of monkey-patching ALL canvas contexts globally (breaking third-party libs,
-// DevTools, and any non-game canvas), we provide a targeted optimizer.
-window.CanvasOptimizer = {
-  /**
-   * Apply state-caching optimizations to a specific 2D context.
-   * Only call this on the game's main canvas and chunk canvases.
-   * @param {CanvasRenderingContext2D} ctx
-   * @returns {CanvasRenderingContext2D} The same ctx, optimized
-   */
-  optimize(ctx) {
-    if (!ctx || ctx.__tu_optimized) return ctx;
-    ctx.__tu_optimized = true;
-    let currentAlpha = 1, currentFill = "#000000";
-    const alphaDesc = Object.getOwnPropertyDescriptor(CanvasRenderingContext2D.prototype, "globalAlpha");
-    const fillDesc = Object.getOwnPropertyDescriptor(CanvasRenderingContext2D.prototype, "fillStyle");
-    Object.defineProperty(ctx, "globalAlpha", {
-      get() { return currentAlpha; },
-      set(val) { currentAlpha !== val && (currentAlpha = val, alphaDesc.set.call(this, val)); }
-    });
-    Object.defineProperty(ctx, "fillStyle", {
-      get() { return currentFill; },
-      set(val) { currentFill !== val && (currentFill = val, fillDesc.set.call(this, val)); }
-    });
-    const origSave = ctx.save, origRestore = ctx.restore, stateStack = [];
-    ctx.save = function () {
-      stateStack.push({ alpha: currentAlpha, fill: currentFill });
-      origSave.call(this);
-    };
-    ctx.restore = function () {
-      const state = stateStack.pop();
-      if (state) { currentAlpha = state.alpha; currentFill = state.fill; }
-      origRestore.call(this);
-    };
-    return ctx;
-  }
-};
-// Backward compat: still intercept getContext but ONLY for canvases marked with data-tu-optimize
-// This avoids breaking DevTools canvas inspector and third-party widgets
+// --- TU Canvas State Optimizer Injected ---
 !function () {
   const originalGetContext = HTMLCanvasElement.prototype.getContext;
   HTMLCanvasElement.prototype.getContext = function (type, options) {
     const ctx = originalGetContext.call(this, type, options);
-    // Phase 2: Only auto-optimize canvases explicitly marked OR the main game canvas
     if ("2d" === type && ctx && !ctx.__tu_optimized) {
-      const isGameCanvas = this.id === 'game' || this.id === 'game-canvas' || this.hasAttribute('data-tu-optimize');
-      if (isGameCanvas) {
-        window.CanvasOptimizer.optimize(ctx);
-      }
+      ctx.__tu_optimized = !0;
+      let currentAlpha = 1,
+        currentFill = "#000000";
+      // Override setters to prevent redundant calls to C++ bindings
+      Object.defineProperty(ctx, "globalAlpha", {
+        get: function () {
+          return currentAlpha;
+        },
+        set: function (val) {
+          currentAlpha !== val && (currentAlpha = val,
+          // Use internal setter
+          Object.getOwnPropertyDescriptor(CanvasRenderingContext2D.prototype, "globalAlpha").set.call(this, val));
+        }
+      });
+      Object.defineProperty(ctx, "fillStyle", {
+        get: function () {
+          return currentFill;
+        },
+        set: function (val) {
+          currentFill !== val && (currentFill = val, Object.getOwnPropertyDescriptor(CanvasRenderingContext2D.prototype, "fillStyle").set.call(this, val));
+        }
+      }); // Intercept save/restore to track state (optional, but complex, leaving alpha/fill is 80% of the gain)
+      const origSave = ctx.save,
+        origRestore = ctx.restore,
+        stateStack = [];
+      ctx.save = function () {
+        stateStack.push({
+          alpha: currentAlpha,
+          fill: currentFill
+        });
+        origSave.call(this);
+      };
+      ctx.restore = function () {
+        const state = stateStack.pop();
+        if (state) { currentAlpha = state.alpha; currentFill = state.fill; }
+        origRestore.call(this);
+      };
     }
     return ctx;
   };
@@ -5773,101 +5633,6 @@ const TU_PERF = "undefined" != typeof performance && performance && "function" =
   global.TU_SAFE = {
     reportError(error, context) {
       ErrorReporter.report(error, context);
-    }
-  };
-
-  // ============================================================
-  // Phase 0: GlobalErrorBoundary - explicit error surfacing
-  // Replaces silent catch-and-swallow with visible console errors
-  // ============================================================
-  global.GlobalErrorBoundary = {
-    _fatalCount: 0,
-    _maxFatal: 20,
-
-    /** Wrap sync function - logs + rethrows on fatal categories */
-    guard(tag, fn, opts) {
-      try {
-        return fn();
-      } catch(e) {
-        this._report(tag, e, opts);
-        if (opts && opts.rethrow) throw e;
-        return opts && opts.fallback;
-      }
-    },
-
-    /** Wrap async function - catches rejections explicitly */
-    async guardAsync(tag, fn, opts) {
-      try {
-        return await fn();
-      } catch(e) {
-        this._report(tag, e, opts);
-        if (opts && opts.rethrow) throw e;
-        return opts && opts.fallback;
-      }
-    },
-
-    _report(tag, error, opts) {
-      this._fatalCount++;
-      const isFatal = this._isFatal(error);
-      const level = isFatal ? 'error' : ((opts && opts.level) || 'warn');
-      // Phase 0: ALWAYS surface to console - never silent
-      console[level]('[GlobalErrorBoundary]', tag, error);
-      if (global.TU_Defensive && global.TU_Defensive.ErrorReporter) {
-        global.TU_Defensive.ErrorReporter.report(error, { phase: 'runtime', source: tag });
-      }
-      if (isFatal && global.GameEvents && global.GameEvents.emit) {
-        global.GameEvents.emit('error:fatal', { tag, error, at: Date.now() });
-      }
-    },
-
-    _isFatal(e) {
-      if (!e) return false;
-      const msg = (e.message || e + '').toLowerCase();
-      // IDB write failures, quota exceeded, worker termination = fatal
-      return msg.includes('quotaexceedederror') ||
-             msg.includes('indexeddb') ||
-             msg.includes('worker') && msg.includes('terminat') ||
-             msg.includes('out of memory');
-    }
-  };
-
-  // ============================================================
-  // Phase 0: PerformanceBaseline - frame time p95/p99 collection
-  // ============================================================
-  global.__TU_PERF_BASELINE__ = {
-    _frameTimes: new Float64Array(300), // ring buffer ~5s at 60fps
-    _tickTimes: new Float64Array(300),
-    _head: 0,
-    _count: 0,
-    _lastFrameStart: 0,
-
-    recordFrameTime(ms) {
-      const idx = this._head % 300;
-      this._frameTimes[idx] = ms;
-      this._head++;
-      if (this._count < 300) this._count++;
-    },
-
-    recordTickTime(ms) {
-      const idx = (this._head - 1 + 300) % 300;
-      this._tickTimes[idx] = ms;
-    },
-
-    /** Get p95/p99 stats for frame and tick times */
-    getStats() {
-      if (this._count < 10) return null;
-      const n = this._count;
-      const frames = Array.from(this._frameTimes.subarray(0, n)).sort((a, b) => a - b);
-      const ticks = Array.from(this._tickTimes.subarray(0, n)).sort((a, b) => a - b);
-      return {
-        frameP50: frames[n * 0.5 | 0],
-        frameP95: frames[n * 0.95 | 0],
-        frameP99: frames[n * 0.99 | 0],
-        tickP50: ticks[n * 0.5 | 0],
-        tickP95: ticks[n * 0.95 | 0],
-        tickP99: ticks[n * 0.99 | 0],
-        sampleCount: n
-      };
     }
   };
   /**
@@ -8825,8 +8590,7 @@ class AudioManager {
    * @param {string} [type='sine'] - Oscillator type
    * @param {number} [vol=1] - Volume multiplier
    */
-  // Phase 1: beep/noise accept optional dest parameter for cave reverb routing
-  beep(freq = 440, dur = 0.06, type = "sine", vol = 1, dest) {
+  beep(freq = 440, dur = 0.06, type = "sine", vol = 1) {
     if (!this.ctx) return;
     const v = (this.settings.sfxVolume || 0) * vol;
     if (v <= 0.0001) return;
@@ -8845,7 +8609,7 @@ class AudioManager {
     g.gain.exponentialRampToValueAtTime(v, now + 0.01);
     g.gain.exponentialRampToValueAtTime(0.0001, now + dur);
     o.connect(g);
-    g.connect(dest || this.ctx.destination);
+    g.connect(this.ctx.destination);
     o.start(now);
     o.stop(now + dur + 0.02);
     const osc = o,
@@ -8855,7 +8619,7 @@ class AudioManager {
       this._releaseGain(gain);
     }, 1000 * (dur + 0.05));
   }
-  noise(dur = 0.08, vol = 1, dest) {
+  noise(dur = 0.08, vol = 1) {
     if (!this.ctx || !this._noiseBuf) return;
     const v = (this.settings.sfxVolume || 0) * vol;
     if (v <= 0.0001) return;
@@ -8869,7 +8633,7 @@ class AudioManager {
     g.gain.exponentialRampToValueAtTime(v, now + 0.01);
     g.gain.exponentialRampToValueAtTime(0.0001, now + dur);
     src.connect(g);
-    g.connect(dest || this.ctx.destination);
+    g.connect(this.ctx.destination);
     src.start(now);
     src.stop(now + dur + 0.02);
     const gain = g;
@@ -8877,148 +8641,29 @@ class AudioManager {
   }
   /** @param {string} kind - Sound effect name */
   play(kind) {
-    if (!this.ctx) try { this.arm(); } catch(e){ console.warn('[AudioManager] arm failed in play()', e); }
     if (["mine", "place", "pickup", "ui", "error"].includes(kind)) {
       try {
-        // Phase 1: Route through cave reverb if available
-        const dest = this._caveFx && this._caveFx.input ? this._caveFx.input : (this.ctx ? this.ctx.destination : null);
         switch (kind) {
           case "mine":
-            this.noise(0.06, 0.9, dest);
-            this.beep(220, 0.05, "triangle", 0.35, dest);
+            this.noise(0.06, 0.9);
+            this.beep(220, 0.05, "triangle", 0.35);
             break;
           case "place":
-            this.beep(320, 0.05, "square", 0.35, dest);
+            this.beep(320, 0.05, "square", 0.35);
             break;
           case "pickup":
-            this.beep(660, 0.05, "sine", 0.35, dest);
+            this.beep(660, 0.05, "sine", 0.35);
             break;
           case "ui":
-            this.beep(520, 0.04, "sine", 0.25, dest);
+            this.beep(520, 0.04, "sine", 0.25);
             break;
           case "error":
-            this.beep(140, 0.08, "sawtooth", 0.4, dest);
+            this.beep(140, 0.08, "sawtooth", 0.4);
         }
       } catch(e){console.warn('[Catch]',e);}
     }
   }
-
-  // ============================================================
-  // Phase 1: Rain synthesis (merged from __rainSynthInstalled patch)
-  // ============================================================
-  _makeLoopNoiseBuffer(seconds) {
-    try {
-      if (!this.ctx) return null;
-      const sr = this.ctx.sampleRate, len = (seconds * sr) | 0;
-      const b = this.ctx.createBuffer(1, len, sr), d = b.getChannelData(0);
-      for (let i = 0; i < len; i++) d[i] = 2 * Math.random() - 1;
-      return b;
-    } catch(e) { console.warn('[AudioManager] _makeLoopNoiseBuffer failed', e); return null; }
-  }
-
-  _startRainSynth() {
-    if (!this.ctx) return false;
-    if (this._rainSynth && this._rainSynth.active) return true;
-    try {
-      const buf = this._makeLoopNoiseBuffer(2);
-      if (!buf) return false;
-      const src = this.ctx.createBufferSource();
-      src.buffer = buf; src.loop = true;
-      const hp = this.ctx.createBiquadFilter(); hp.type = "highpass"; hp.frequency.value = 4200;
-      const lp = this.ctx.createBiquadFilter(); lp.type = "lowpass"; lp.frequency.value = 8500;
-      const gain = this.ctx.createGain(); gain.gain.value = 0;
-      src.connect(hp); hp.connect(lp); lp.connect(gain); gain.connect(this.ctx.destination);
-      src.start();
-      const st = this._rainSynth || (this._rainSynth = {});
-      st.src = src; st.hp = hp; st.lp = lp; st.gain = gain; st.active = true; st.dropAcc = 0;
-      return true;
-    } catch(e) { console.warn('[AudioManager] _startRainSynth failed', e); return false; }
-  }
-
-  _stopRainSynth() {
-    const st = this._rainSynth;
-    if (!st || !st.active) return;
-    try { st.src && st.src.stop(); } catch(e){}
-    try { st.gain && st.gain.disconnect(); } catch(e){}
-    st.active = false;
-  }
-
-  updateWeatherAmbience(dtMs, weather) {
-    if (void 0 === this.enabled) this.enabled = true;
-    const wType = weather && weather.type ? weather.type : "clear";
-    const wInt = Utils.clamp(+(weather && weather.intensity || 0), 0, 1);
-    const thunder = "thunder" === wType;
-    const isRain = "rain" === wType || thunder;
-    const vol = (this.settings && this.settings.sfxVolume || 0);
-    if (!isRain || wInt < 0.02 || vol < 0.001) {
-      this._stopRainSynth();
-      return;
-    }
-    if (!this._rainSynth || !this._rainSynth.active) {
-      if (!this._startRainSynth()) return;
-    }
-    const st = this._rainSynth;
-    if (!st || !st.active) return;
-    const target = vol * (0.04 + 0.14 * wInt) * (thunder ? 1.4 : 1);
-    try {
-      const g = st.gain.gain;
-      g.setTargetAtTime(target, this.ctx.currentTime, 0.12);
-      st.hp.frequency.setTargetAtTime(3800 + 1200 * (1 - wInt), this.ctx.currentTime, 0.2);
-    } catch(e){}
-    // Raindrop hits
-    const dt = Utils.clamp(dtMs, 0, 100);
-    st.dropAcc = (st.dropAcc || 0) + dt;
-    const interval = thunder ? 55 : 80;
-    let fired = 0;
-    while (st.dropAcc >= interval && fired < 4) {
-      st.dropAcc -= interval; fired++;
-      if (0.35 > Math.random()) continue;
-      const dVol = (thunder ? 0.055 : 0.045) + 0.065 * wInt;
-      try { this.noise(0.018 + 0.03 * Math.random(), dVol); } catch(e){}
-    }
-  }
-
-  // ============================================================
-  // Phase 1: Cave reverb (merged from __caveReverbInstalled patch)
-  // ============================================================
-  _ensureCaveFx() {
-    if (!this.ctx || this._caveFx) return;
-    try {
-      const len = (0.6 * this.ctx.sampleRate) | 0;
-      const buf = this.ctx.createBuffer(2, len, this.ctx.sampleRate);
-      for (let ch = 0; ch < 2; ch++) {
-        const d = buf.getChannelData(ch);
-        for (let i = 0; i < len; i++) d[i] = (2 * Math.random() - 1) * Math.pow(1 - i / len, 2.2);
-      }
-      const conv = this.ctx.createConvolver(); conv.buffer = buf;
-      const wet = this.ctx.createGain(); wet.gain.value = 0;
-      const dry = this.ctx.createGain(); dry.gain.value = 1;
-      const input = this.ctx.createGain(); input.gain.value = 1;
-      input.connect(dry); input.connect(conv); conv.connect(wet);
-      dry.connect(this.ctx.destination); wet.connect(this.ctx.destination);
-      this._caveFx = { conv, wet, dry, input };
-    } catch(e) { console.warn('[AudioManager] _ensureCaveFx failed', e); }
-  }
-
-  setEnvironment(depth01, enclosed01) {
-    if (!this.ctx) return;
-    this._ensureCaveFx();
-    if (!this._caveFx) return;
-    try {
-      const d = Utils.clamp(+depth01 || 0, 0, 1);
-      const e = Utils.clamp(+enclosed01 || 0, 0, 1);
-      const wetAmt = Utils.clamp(0.08 + 0.35 * d + 0.2 * e, 0, 0.55);
-      const dryAmt = 1 - 0.3 * wetAmt;
-      const t = this.ctx.currentTime;
-      this._caveFx.wet.gain.setTargetAtTime(wetAmt, t, 0.3);
-      this._caveFx.dry.gain.setTargetAtTime(dryAmt, t, 0.3);
-    } catch(e){}
-  }
 }
-// Phase 1: Mark all patch flags as already installed so monkey patches become no-ops
-AudioManager.prototype.__rainSynthInstalled = true;
-AudioManager.prototype.__caveReverbInstalled = true;
-AudioManager.prototype.__tuAudioVisPatch = true;
 Object.assign(window.TU, {
   AudioManager: AudioManager
 });
@@ -9077,9 +8722,7 @@ Object.assign(window.TU, {
           request.onerror = () => reject(request.error);
         });
       } catch (e) {
-        // Phase 0: Surface IDB errors explicitly instead of silent swallow
-        console.error('[IndexedDBStorage] get failed for key:', key, e);
-        if (window.GlobalErrorBoundary) window.GlobalErrorBoundary._report('IDB.get:' + key, e);
+        console.warn('[IndexedDBStorage] get failed:', e);
         return null;
       }
     }
@@ -9096,9 +8739,7 @@ Object.assign(window.TU, {
           request.onerror = () => reject(request.error);
         });
       } catch (e) {
-        // Phase 0: Surface IDB errors - quota exceeded is fatal for save integrity
-        console.error('[IndexedDBStorage] set failed for key:', key, e);
-        if (window.GlobalErrorBoundary) window.GlobalErrorBoundary._report('IDB.set:' + key, e);
+        console.warn('[IndexedDBStorage] set failed:', e);
         return false;
       }
     }
@@ -9723,8 +9364,6 @@ class SaveSystem {
     const payload = {
       v: 1,
       ts: Date.now(),
-      // Phase 3: Embed block palette for ID stability across patch versions
-      palette: window.BlockRegistry ? window.BlockRegistry.toPalette() : null,
       seed: Number.isFinite(g.seed) ? g.seed : Number.isFinite(this.seed) ? this.seed : Date.now(),
       timeOfDay: Utils.clamp(g.timeOfDay || .35, 0, 1),
       player: {
@@ -9759,14 +9398,6 @@ class SaveSystem {
   applyToWorld(world, save) {
     if (!world || !save) return;
     if (!save._diffMap) return;
-
-    // Phase 3: Check for palette remap if save contains a palette header
-    let _remap = null;
-    if (save.palette && window.BlockRegistry) {
-      _remap = window.BlockRegistry.buildRemapFromPalette(save.palette);
-      if (_remap) console.info('[SaveSystem] Palette remap applied - IDs have changed since this save');
-    }
-
     let appliedCount = 0;
     const WATER = window.BLOCK && window.BLOCK.WATER || 27,
       tf = world.tilesFlat,
@@ -9788,7 +9419,7 @@ class SaveSystem {
           col = tiles ? tiles[x] : null;
         if (!col) continue;
         const old = 0 | col[y],
-          nid = _remap ? (0 | _remap[0 | id]) : (0 | id); // Phase 3: Apply palette remap
+          nid = 0 | id;
         if (old !== nid) {
           this.diffBase && (this.diffBase.has(k) || this.diffBase.set(k, old));
           if (col[y] = nid, hasFlat && (tf[x * world.h + y | 0] = nid), old === WATER || nid === WATER) if (waterChanged = !0, hasChunkA) {
@@ -10530,91 +10161,6 @@ const CONFIG = Object.freeze({
   });
 // Block IDs 0-161: frozen constants enable V8 optimization, stable IDs for serialization/networking
 window.Constants = Constants;
-
-// ============================================================
-// Phase 3: BlockRegistry - Palette mapping for save/load ID stability
-// Prevents ID drift when patches add/reorder blocks
-// ============================================================
-window.BlockRegistry = (() => {
-  // Build name->id and id->name maps from the frozen BLOCK enum
-  const _nameToId = new Map();
-  const _idToName = new Map();
-  let _nextDynamic = 162; // first dynamic ID (after frozen range 0-161)
-
-  // Initialize from frozen BLOCK constants
-  for (const [name, id] of Object.entries(BLOCK)) {
-    _nameToId.set(name, id);
-    _idToName.set(id, name);
-  }
-
-  return {
-    /** Get block ID by name. Returns undefined if not registered. */
-    getId(name) { return _nameToId.get(name); },
-
-    /** Get block name by ID. Returns undefined if not registered. */
-    getName(id) { return _idToName.get(id); },
-
-    /**
-     * Register a dynamic block (from patches). Returns stable ID.
-     * If already registered, returns existing ID.
-     * @param {string} name - Unique block name
-     * @param {Object} [opts] - Optional metadata
-     * @returns {number} Assigned block ID
-     */
-    registerDynamic(name, opts) {
-      if (_nameToId.has(name)) return _nameToId.get(name);
-      const id = _nextDynamic++;
-      _nameToId.set(name, id);
-      _idToName.set(id, name);
-      return id;
-    },
-
-    /**
-     * Generate a palette mapping for save file headers.
-     * Maps name -> id for all registered blocks.
-     * @returns {Object} { [name]: id }
-     */
-    toPalette() {
-      const palette = {};
-      for (const [name, id] of _nameToId) palette[name] = id;
-      return palette;
-    },
-
-    /**
-     * Build a remapping table from a saved palette to current IDs.
-     * Returns null if no remapping needed (all IDs match).
-     * @param {Object} savedPalette - { [name]: savedId }
-     * @returns {Int32Array|null} remap[savedId] = currentId, or null
-     */
-    buildRemapFromPalette(savedPalette) {
-      if (!savedPalette || typeof savedPalette !== 'object') return null;
-      let needsRemap = false;
-      let maxSavedId = 0;
-      for (const name in savedPalette) {
-        const savedId = savedPalette[name];
-        if (savedId > maxSavedId) maxSavedId = savedId;
-        const currentId = _nameToId.get(name);
-        if (currentId !== undefined && currentId !== savedId) needsRemap = true;
-      }
-      if (!needsRemap) return null;
-      const remap = new Int32Array(maxSavedId + 1);
-      for (let i = 0; i <= maxSavedId; i++) remap[i] = i; // identity default
-      for (const name in savedPalette) {
-        const savedId = savedPalette[name];
-        const currentId = _nameToId.get(name);
-        if (currentId !== undefined) remap[savedId] = currentId;
-        else console.warn('[BlockRegistry] Unknown block in save:', name, 'id:', savedId);
-      }
-      return remap;
-    },
-
-    /** @returns {number} Total registered block count */
-    get size() { return _nameToId.size; },
-
-    /** @returns {number} Next available dynamic ID */
-    get nextDynamicId() { return _nextDynamic; }
-  };
-})();
 const BLOCK_DATA = {
     [BLOCK.AIR]: {
       name: "空气",
@@ -18917,15 +18463,8 @@ class Renderer {
       }));
       this.ctx.imageSmoothingEnabled = !1;
     }
-    // Phase 2: Apply scoped optimization to game canvas context
-    if (this.ctx && window.CanvasOptimizer) window.CanvasOptimizer.optimize(this.ctx);
     window.GameEvents.on('block:written', e => this.invalidateTile(e.x, e.y));
     if (!this.ctx) throw Error("Canvas 2D context initialization failed");
-
-    // Phase 2: PostFX pipeline - linear array of stages instead of onion wrapping
-    // Each stage: { name: string, order: number, fn: (renderer, time, depth01, reducedMotion) => void }
-    this.postFxPipeline = [];
-
     // Flicker detection state (pixel-based, runs first 30 frames)
     this._flickerCheckFrames = 0;
     this._flickerCheckMax = 30;
@@ -21386,8 +20925,6 @@ class Renderer {
       ctx.drawImage(fvlBuf, 0, 0);
     }
     ctx.restore();
-    // Phase 2: Run registered pipeline stages after base PostFX
-    this._runPostFxPipeline(time, depth01, reducedMotion);
     window.GameEvents && window.GameEvents.emit && window.GameEvents.emit('renderer:postFX:complete', this, time, depth01, reducedMotion);
   }
   /**
@@ -21397,43 +20934,6 @@ class Renderer {
    */
   postProcess(time = .5) {
     this.applyPostFX(time, 0, !1);
-  }
-
-  // ============================================================
-  // Phase 2: PostFX Pipeline API
-  // Stages run in order after the base applyPostFX.
-  // This allows extensions to register once instead of wrapping.
-  // ============================================================
-  /**
-   * Register a post-processing stage.
-   * @param {string} name - Unique stage name
-   * @param {number} order - Sort order (lower = earlier). 
-   *   10=base, 20=weather_tint, 30=weather_optimized, 40=underwater, 50=biome_sky
-   * @param {Function} fn - (renderer, time, depth01, reducedMotion) => void
-   */
-  registerPostFxStage(name, order, fn) {
-    // Remove existing stage with same name
-    this.postFxPipeline = this.postFxPipeline.filter(s => s.name !== name);
-    this.postFxPipeline.push({ name, order, fn });
-    this.postFxPipeline.sort((a, b) => a.order - b.order);
-  }
-
-  /** Remove a post-processing stage by name */
-  removePostFxStage(name) {
-    this.postFxPipeline = this.postFxPipeline.filter(s => s.name !== name);
-  }
-
-  /** Execute all registered pipeline stages */
-  _runPostFxPipeline(time, depth01, reducedMotion) {
-    const pipeline = this.postFxPipeline;
-    if (!pipeline || !pipeline.length) return;
-    for (let i = 0, len = pipeline.length; i < len; i++) {
-      try {
-        pipeline[i].fn(this, time, depth01, reducedMotion);
-      } catch(e) {
-        console.warn('[PostFxPipeline] Stage "' + pipeline[i].name + '" error:', e);
-      }
-    }
   }
   // Utility methods: merged from multiple patch versions for backward compatibility
   /**
@@ -23533,41 +23033,6 @@ class InputManager {
       const fm = window.TU && window.TU.FullscreenManager;
       fm && "function" == typeof fm.toggle ? fm.toggle() : document.fullscreenElement ? document.exitFullscreen() : (document.documentElement).requestFullscreen();
     });
-
-    // Phase 1: Merged from __tuInputSafety patch - anti-stuck-key protection
-    // Previously monkey-patched onto InputManager.prototype.bind; now native.
-    const _resetMouseButtons = () => {
-      game && game.input && (window.GameEvents.emit('input:set', 'mouseLeft', false), window.GameEvents.emit('input:set', 'mouseRight', false));
-    };
-    const _resetAllInputs = () => {
-      game && game.input && (window.GameEvents.emit('input:set', 'left', false), window.GameEvents.emit('input:set', 'right', false), window.GameEvents.emit('input:set', 'jump', false), window.GameEvents.emit('input:set', 'sprint', false));
-      _resetMouseButtons();
-    };
-    // Window blur/tab switch: avoid "stuck key/button"
-    window.addEventListener("blur", _resetAllInputs, { passive: true });
-    document.addEventListener("visibilitychange", () => { document.hidden && _resetAllInputs(); }, { passive: true });
-    // Mouse leaves canvas: clear mouse buttons to avoid "stuck mining/placing"
-    canvas && canvas.addEventListener("mouseleave", _resetMouseButtons, { passive: true });
-    // Mouse up anywhere: clear buttons even if released outside canvas
-    window.addEventListener("mouseup", _resetMouseButtons, { passive: true });
-    // Wheel slot switching (merged from __tuWheelBound)
-    canvas && canvas.addEventListener("wheel", e => {
-      if (e.ctrlKey) return; // allow browser zoom
-      const g = window.AppServices.get("game");
-      const ui = window.AppServices.get("ui");
-      if (!g || !ui || !g.player) return;
-      if (window.AppServices.get("uiState") && window.AppServices.get("uiState").isAnyOpen() || g._inputBlocked) return;
-      const dx = +e.deltaX || 0, dy = +e.deltaY || 0;
-      const delta = (0 > dx ? -dx : dx) > (0 > dy ? -dy : dy) ? dx : dy;
-      if (!delta || 1 > (0 > delta ? -delta : delta)) return;
-      e.preventDefault();
-      const dir = delta > 0 ? 1 : -1;
-      const next = ((0 | (Number.isFinite(g.player.selectedSlot) ? g.player.selectedSlot : 0)) + dir + 9) % 9;
-      try { window.GameEvents && window.GameEvents.emit && window.GameEvents.emit("ui:selectSlot", next); } catch(e2){ console.warn('[Catch]', e2); }
-    }, { passive: false });
-    // Mark as already bound so the old patch becomes a no-op
-    this.__tuExtraBound = true;
-    this.__tuInputSafety = true;
   }
   /**
    * Fixed-step tick to compute "hold A/D to sprint" without being affected by key repeat.
@@ -23798,20 +23263,6 @@ class Game {
     this._screenImpactCenterScale = 1;
     this.input = createInputState();
     this.isMobile = Utils.isMobile();
-
-    // Phase 2: Unified weather state - single source of truth
-    // Previously scattered across game.weather, window.AppServices.get('weatherFx'), and 5 different patches
-    this.weather = {
-      type: 'clear', intensity: 0, targetIntensity: 0,
-      nextType: 'clear', nextIntensity: 0, lightning: 0,
-      acid: false, // acid rain flag
-      // PostFX tint params (consolidated from weatherFx service)
-      fx: { postMode: 'source-over', postR: 0, postG: 0, postB: 0, postA: 0, lightning: 0,
-            shadowColor: 'rgb(10,5,20)', shadowAlpha: 0 }
-    };
-    // Register as AppService for backward compat
-    window.AppServices.register('weatherFx', this.weather.fx);
-
     window.GameEvents.on('player:died', e => {
       const msg = e.kind === 'acid' ? "💀 你被酸雨腐蚀了…" : "💀 你死了…";
       if (typeof Toast !== 'undefined' && Toast.show) window.GameEvents.emit('ui:toast', msg, 1500);
@@ -24459,11 +23910,7 @@ class Game {
     loading.style.transition = "opacity 0.4s cubic-bezier(0.4, 0, 0.2, 1)";
     loading.style.opacity = "0";
     setTimeout(() => loading.style.display = "none", 420);
-    // Phase 1: Dedup guard - game:init:post should only fire once per game instance
-    if (!this.__initPostFired) {
-      this.__initPostFired = true;
-      window.GameEvents && window.GameEvents.emit && window.GameEvents.emit('game:init:post', this);
-    }
+    window.GameEvents && window.GameEvents.emit && window.GameEvents.emit('game:init:post', this);
     this._startRaf();
   }
   _bindEvents() {
@@ -24771,9 +24218,6 @@ class Game {
      */);
   }
   loop(timestamp) {
-    // Phase 0: Record frame start for performance baseline
-    const __perfBL = window.__TU_PERF_BASELINE__;
-    const __frameStart = performance.now();
     // Allow external explicit frame stop (e.g. error fallback layer/manual render pause)
     if (!this._rafRunning) return;
     if (window.__TU_FATAL_ERROR__) return void (this._rafRunning = !1);
@@ -25005,8 +24449,6 @@ class Game {
     const uiFlush = this.uiFlush;
     uiFlush && uiFlush.flush();
     frameHadError || (this._loopErrorCount = 0, this._loopErrorWindowStart = 0);
-    // Phase 0: Record frame time for performance baseline
-    if (__perfBL) __perfBL.recordFrameTime(performance.now() - __frameStart);
     this._rafRunning && requestAnimationFrame(this._rafCb);
   }
   _updateDynamicChunks(player, world) {
@@ -29441,13 +28883,16 @@ window.TU;
           Game = TU.Game,
           InputManager = TU.InputManager,
           AudioManager = TU.AudioManager;
-        // Phase 1: REMOVED duplicate game:init:post emission
-        // Game.init() already emits 'game:init:post' at the end of its own init flow (line ~23913).
-        // This patch was wrapping Game.prototype.init to emit it AGAIN, causing double-fire
-        // which led to first-frame stuttering and double initialization of event listeners.
-        // The __tuGameReadyEvent flag is preserved to prevent other patches from re-adding this.
-        if (Game && Game.prototype) {
+        if (Game && Game.prototype && !Game.prototype.__tuGameReadyEvent) {
           Game.prototype.__tuGameReadyEvent = !0;
+          const _init = Game.prototype.init;
+          "function" == typeof _init && (Game.prototype.init = async function (...args) {
+            const r = await _init.apply(this, args);
+            try {
+              window.GameEvents.emit("game:init:post", this);
+            } catch(e){console.warn('[Catch]',e);}
+            return r;
+          });
         }
         if (InputManager && InputManager.prototype && !InputManager.prototype.__tuInputSafety) {
           InputManager.prototype.__tuInputSafety = !0;
@@ -31483,21 +30928,12 @@ window.TU;
             if (!SUPPORT_GEN_WORKER) throw Error("Worker not supported");
             if (!Number.isInteger(w) || 0 >= w || w > 1e4) throw Error("Invalid world width: " + w);
             if (!Number.isInteger(h) || 0 >= h || h > 1e4) throw Error("Invalid world height: " + h);
-            // Phase 3: Add generation timeout to prevent permanent Promise hang
             return null == seed && (seed = Date.now()), this._ensureWorker(), this._sendInitOnce(), this._worldReady = !1, this._lightSynced = !1, await new Promise((resolve, reject) => {
               const id = this._reqId++;
-              // Phase 3: 30s timeout for world generation - prevents permanent hang
-              const _genTimeout = setTimeout(() => {
-                if (this._pendingGen && this._pendingGen.id === id) {
-                  console.error('[WorldWorkerClient] Generation timed out after 30s, falling back to main thread');
-                  this._pendingGen = null;
-                  reject(Error('Worker generation timeout (30s)'));
-                }
-              }, 30000);
               this._pendingGen = {
                 id: id,
-                resolve: (result) => { clearTimeout(_genTimeout); resolve(result); },
-                reject: (err) => { clearTimeout(_genTimeout); reject(err); },
+                resolve: resolve,
+                reject: reject,
                 progressCb: "function" == typeof progressCb ? progressCb : null,
                 t0: _safeNow()
               };

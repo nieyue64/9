@@ -1,38 +1,4 @@
 <!doctype html>
-<!--
-  ============================================================
-  Terraria Ultra - Architecture Refactored Edition
-  ============================================================
-  REFACTORING CHANGELOG (5-Phase Governance):
-  
-  Phase 0 - Safety Net & Performance Baselines:
-    - TU.Safe.run: async/Promise rejection handling, runAsync()
-    - GlobalErrorBoundary: explicit fatal error surfacing
-    - PerformanceBaseline: frame/tick p50/p95/p99 collection
-    - IndexedDB errors surfaced (no more silent swallowing)
-  
-  Phase 1 - Native Class Integration & Timing Fixes:
-    - game:init:post double-fire eliminated (dedup guard)
-    - InputManager.bind: safety patch merged natively (blur/focus reset)
-    - AudioManager: rain synth, cave reverb, weather ambience merged natively
-    - beep()/noise() accept dest param for reverb routing
-  
-  Phase 2 - Render Pipeline & API Isolation:
-    - Global Canvas getContext hijack -> scoped CanvasOptimizer
-    - Renderer.postFxPipeline: ordered array replaces onion wrapping
-    - registerPostFxStage/removePostFxStage API
-    - Unified game.weather state (single source of truth)
-  
-  Phase 3 - Storage Resilience & Worker Rebuild:
-    - StorageAdapter: LS->IDB degradation, quota error surfacing
-    - BlockRegistry: palette mapping in save headers, ID remap on load
-    - WorldWorkerClient.generate: 30s timeout prevents permanent hang
-  
-  Phase 4 - Cleanup & Validation:
-    - Pre-set __xxxInstalled flags disable redundant monkey patches
-    - Architecture comments and deprecation markers
-  ============================================================
--->
 <html lang="zh-CN">
 
 <head>
@@ -5181,100 +5147,25 @@ window.AppServices = new class ServiceLocator {
     this.register("blockHardness", window.BLOCK_HARDNESS);
     this.register("blockLightLut", window.BLOCK_LIGHT_LUT);
     this.register("structuresJson", window.TU_STRUCTURES_JSON);
-    // Phase 3: StorageAdapter with LS -> IDB degradation and explicit error surfacing
-    this.register("storage", (() => {
-      const _lsAvailable = (() => { try { const t = '__tu_test__'; localStorage.setItem(t, '1'); localStorage.removeItem(t); return true; } catch { return false; } })();
-      let _quotaExceeded = false;
-      let _idbFallback = null; // lazy-init IndexedDB reference
-
-      const _getIDB = () => {
-        if (_idbFallback) return _idbFallback;
-        if (window.TU_IndexedDBStorage) { _idbFallback = window.TU_IndexedDBStorage; return _idbFallback; }
-        return null;
-      };
-
-      return {
-        /** @returns {boolean} Whether localStorage is available */
-        get lsAvailable() { return _lsAvailable; },
-        /** @returns {boolean} Whether quota has been exceeded */
-        get quotaExceeded() { return _quotaExceeded; },
-
-        get(k) {
-          try {
-            if (_lsAvailable) return localStorage.getItem(k);
-          } catch (e) {
-            console.warn('[StorageAdapter] LS get failed:', k, e);
-          }
+    this.register("storage", {
+      get: k => {
+        try {
+          return localStorage.getItem(k);
+        } catch (e) {
           return null;
-        },
-
-        set(k, v) {
-          try {
-            if (_lsAvailable) {
-              localStorage.setItem(k, v);
-              _quotaExceeded = false;
-              return;
-            }
-          } catch (e) {
-            // Phase 3: Surface QuotaExceededError explicitly
-            if (e && e.name === 'QuotaExceededError') {
-              _quotaExceeded = true;
-              console.error('[StorageAdapter] QUOTA EXCEEDED for key:', k, 'size:', (v || '').length);
-              if (window.GlobalErrorBoundary) window.GlobalErrorBoundary._report('StorageAdapter.set:quota', e);
-              // Attempt IDB fallback for critical save data
-              const idb = _getIDB();
-              if (idb && (k === 'terraria_ultra_save_v1' || k.startsWith('tu_'))) {
-                idb.set(k, v).catch(e2 => console.error('[StorageAdapter] IDB fallback also failed:', e2));
-              }
-              return;
-            }
-            console.warn('[StorageAdapter] LS set failed:', k, e);
-          }
-        },
-
-        remove(k) {
-          try {
-            if (_lsAvailable) window.localStorage.removeItem(k);
-          } catch(e) { console.warn('[StorageAdapter] LS remove failed:', k, e); }
-        },
-
-        /** Async get with IDB fallback - for save data */
-        async getAsync(k) {
-          // Try LS first
-          try {
-            if (_lsAvailable) {
-              const v = localStorage.getItem(k);
-              if (v) return v;
-            }
-          } catch(e) {}
-          // Fall back to IDB
-          const idb = _getIDB();
-          if (idb) {
-            try { return await idb.get(k); } catch(e) { console.error('[StorageAdapter] IDB getAsync failed:', k, e); }
-          }
-          return null;
-        },
-
-        /** Async set with IDB fallback */
-        async setAsync(k, v) {
-          let lsOk = false;
-          try {
-            if (_lsAvailable) { localStorage.setItem(k, v); lsOk = true; }
-          } catch(e) {
-            if (e && e.name === 'QuotaExceededError') {
-              _quotaExceeded = true;
-              console.error('[StorageAdapter] QUOTA EXCEEDED (async) for key:', k);
-            }
-          }
-          // Always write to IDB as backup
-          const idb = _getIDB();
-          if (idb) {
-            try { await idb.set(k, v); } catch(e) { console.error('[StorageAdapter] IDB setAsync failed:', k, e); }
-          }
-          return { lsOk, idbOk: !!idb };
         }
-      };
-    })());
+      },
+      set: (k, v) => {
+        try {
+          localStorage.setItem(k, v);
+        } catch(e){console.warn('[Catch]',e);}
+      },
+      remove: k => {
+        try {
+          window.localStorage.removeItem(k);
+        } catch(e){console.warn('[Catch]',e);}
+      }
+    });
     this.register("session", {
       get: k => {
         try {
@@ -9723,8 +9614,6 @@ class SaveSystem {
     const payload = {
       v: 1,
       ts: Date.now(),
-      // Phase 3: Embed block palette for ID stability across patch versions
-      palette: window.BlockRegistry ? window.BlockRegistry.toPalette() : null,
       seed: Number.isFinite(g.seed) ? g.seed : Number.isFinite(this.seed) ? this.seed : Date.now(),
       timeOfDay: Utils.clamp(g.timeOfDay || .35, 0, 1),
       player: {
@@ -9759,14 +9648,6 @@ class SaveSystem {
   applyToWorld(world, save) {
     if (!world || !save) return;
     if (!save._diffMap) return;
-
-    // Phase 3: Check for palette remap if save contains a palette header
-    let _remap = null;
-    if (save.palette && window.BlockRegistry) {
-      _remap = window.BlockRegistry.buildRemapFromPalette(save.palette);
-      if (_remap) console.info('[SaveSystem] Palette remap applied - IDs have changed since this save');
-    }
-
     let appliedCount = 0;
     const WATER = window.BLOCK && window.BLOCK.WATER || 27,
       tf = world.tilesFlat,
@@ -9788,7 +9669,7 @@ class SaveSystem {
           col = tiles ? tiles[x] : null;
         if (!col) continue;
         const old = 0 | col[y],
-          nid = _remap ? (0 | _remap[0 | id]) : (0 | id); // Phase 3: Apply palette remap
+          nid = 0 | id;
         if (old !== nid) {
           this.diffBase && (this.diffBase.has(k) || this.diffBase.set(k, old));
           if (col[y] = nid, hasFlat && (tf[x * world.h + y | 0] = nid), old === WATER || nid === WATER) if (waterChanged = !0, hasChunkA) {
@@ -10530,91 +10411,6 @@ const CONFIG = Object.freeze({
   });
 // Block IDs 0-161: frozen constants enable V8 optimization, stable IDs for serialization/networking
 window.Constants = Constants;
-
-// ============================================================
-// Phase 3: BlockRegistry - Palette mapping for save/load ID stability
-// Prevents ID drift when patches add/reorder blocks
-// ============================================================
-window.BlockRegistry = (() => {
-  // Build name->id and id->name maps from the frozen BLOCK enum
-  const _nameToId = new Map();
-  const _idToName = new Map();
-  let _nextDynamic = 162; // first dynamic ID (after frozen range 0-161)
-
-  // Initialize from frozen BLOCK constants
-  for (const [name, id] of Object.entries(BLOCK)) {
-    _nameToId.set(name, id);
-    _idToName.set(id, name);
-  }
-
-  return {
-    /** Get block ID by name. Returns undefined if not registered. */
-    getId(name) { return _nameToId.get(name); },
-
-    /** Get block name by ID. Returns undefined if not registered. */
-    getName(id) { return _idToName.get(id); },
-
-    /**
-     * Register a dynamic block (from patches). Returns stable ID.
-     * If already registered, returns existing ID.
-     * @param {string} name - Unique block name
-     * @param {Object} [opts] - Optional metadata
-     * @returns {number} Assigned block ID
-     */
-    registerDynamic(name, opts) {
-      if (_nameToId.has(name)) return _nameToId.get(name);
-      const id = _nextDynamic++;
-      _nameToId.set(name, id);
-      _idToName.set(id, name);
-      return id;
-    },
-
-    /**
-     * Generate a palette mapping for save file headers.
-     * Maps name -> id for all registered blocks.
-     * @returns {Object} { [name]: id }
-     */
-    toPalette() {
-      const palette = {};
-      for (const [name, id] of _nameToId) palette[name] = id;
-      return palette;
-    },
-
-    /**
-     * Build a remapping table from a saved palette to current IDs.
-     * Returns null if no remapping needed (all IDs match).
-     * @param {Object} savedPalette - { [name]: savedId }
-     * @returns {Int32Array|null} remap[savedId] = currentId, or null
-     */
-    buildRemapFromPalette(savedPalette) {
-      if (!savedPalette || typeof savedPalette !== 'object') return null;
-      let needsRemap = false;
-      let maxSavedId = 0;
-      for (const name in savedPalette) {
-        const savedId = savedPalette[name];
-        if (savedId > maxSavedId) maxSavedId = savedId;
-        const currentId = _nameToId.get(name);
-        if (currentId !== undefined && currentId !== savedId) needsRemap = true;
-      }
-      if (!needsRemap) return null;
-      const remap = new Int32Array(maxSavedId + 1);
-      for (let i = 0; i <= maxSavedId; i++) remap[i] = i; // identity default
-      for (const name in savedPalette) {
-        const savedId = savedPalette[name];
-        const currentId = _nameToId.get(name);
-        if (currentId !== undefined) remap[savedId] = currentId;
-        else console.warn('[BlockRegistry] Unknown block in save:', name, 'id:', savedId);
-      }
-      return remap;
-    },
-
-    /** @returns {number} Total registered block count */
-    get size() { return _nameToId.size; },
-
-    /** @returns {number} Next available dynamic ID */
-    get nextDynamicId() { return _nextDynamic; }
-  };
-})();
 const BLOCK_DATA = {
     [BLOCK.AIR]: {
       name: "空气",
@@ -31483,21 +31279,12 @@ window.TU;
             if (!SUPPORT_GEN_WORKER) throw Error("Worker not supported");
             if (!Number.isInteger(w) || 0 >= w || w > 1e4) throw Error("Invalid world width: " + w);
             if (!Number.isInteger(h) || 0 >= h || h > 1e4) throw Error("Invalid world height: " + h);
-            // Phase 3: Add generation timeout to prevent permanent Promise hang
             return null == seed && (seed = Date.now()), this._ensureWorker(), this._sendInitOnce(), this._worldReady = !1, this._lightSynced = !1, await new Promise((resolve, reject) => {
               const id = this._reqId++;
-              // Phase 3: 30s timeout for world generation - prevents permanent hang
-              const _genTimeout = setTimeout(() => {
-                if (this._pendingGen && this._pendingGen.id === id) {
-                  console.error('[WorldWorkerClient] Generation timed out after 30s, falling back to main thread');
-                  this._pendingGen = null;
-                  reject(Error('Worker generation timeout (30s)'));
-                }
-              }, 30000);
               this._pendingGen = {
                 id: id,
-                resolve: (result) => { clearTimeout(_genTimeout); resolve(result); },
-                reject: (err) => { clearTimeout(_genTimeout); reject(err); },
+                resolve: resolve,
+                reject: reject,
                 progressCb: "function" == typeof progressCb ? progressCb : null,
                 t0: _safeNow()
               };

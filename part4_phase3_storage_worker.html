@@ -1,38 +1,4 @@
 <!doctype html>
-<!--
-  ============================================================
-  Terraria Ultra - Architecture Refactored Edition
-  ============================================================
-  REFACTORING CHANGELOG (5-Phase Governance):
-  
-  Phase 0 - Safety Net & Performance Baselines:
-    - TU.Safe.run: async/Promise rejection handling, runAsync()
-    - GlobalErrorBoundary: explicit fatal error surfacing
-    - PerformanceBaseline: frame/tick p50/p95/p99 collection
-    - IndexedDB errors surfaced (no more silent swallowing)
-  
-  Phase 1 - Native Class Integration & Timing Fixes:
-    - game:init:post double-fire eliminated (dedup guard)
-    - InputManager.bind: safety patch merged natively (blur/focus reset)
-    - AudioManager: rain synth, cave reverb, weather ambience merged natively
-    - beep()/noise() accept dest param for reverb routing
-  
-  Phase 2 - Render Pipeline & API Isolation:
-    - Global Canvas getContext hijack -> scoped CanvasOptimizer
-    - Renderer.postFxPipeline: ordered array replaces onion wrapping
-    - registerPostFxStage/removePostFxStage API
-    - Unified game.weather state (single source of truth)
-  
-  Phase 3 - Storage Resilience & Worker Rebuild:
-    - StorageAdapter: LS->IDB degradation, quota error surfacing
-    - BlockRegistry: palette mapping in save headers, ID remap on load
-    - WorldWorkerClient.generate: 30s timeout prevents permanent hang
-  
-  Phase 4 - Cleanup & Validation:
-    - Pre-set __xxxInstalled flags disable redundant monkey patches
-    - Architecture comments and deprecation markers
-  ============================================================
--->
 <html lang="zh-CN">
 
 <head>
